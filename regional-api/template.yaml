@@ -1,0 +1,268 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Regional API Gateway with Lambda integration, DynamoDB, and Cognito User Pool
+
+Parameters:
+  Stage:
+    Type: String
+    Default: dev
+    Description: Deployment stage for the API
+
+Resources:
+  # DynamoDB Table for Customer Data
+  CustomerTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'customer-data-${Stage}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: customerId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: customerId
+          KeyType: HASH
+      SSESpecification:
+        SSEEnabled: true
+
+  # Cognito User Pool for Authentication
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub 'customer-user-pool-${Stage}'
+      AutoVerifiedAttributes:
+        - email
+      UsernameAttributes:
+        - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+          RequireUppercase: true
+
+  # Cognito User Pool Client
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub 'customer-app-client-${Stage}'
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_ADMIN_USER_PASSWORD_AUTH
+      CallbackURLs:
+        - https://example.com/callback
+      LogoutURLs:
+        - https://example.com/logout
+      AllowedOAuthFlows:
+        - implicit
+        - code
+      AllowedOAuthScopes:
+        - phone
+        - email
+        - openid
+        - profile
+        - aws.cognito.signin.user.admin
+      AllowedOAuthFlowsUserPoolClient: true
+      PreventUserExistenceErrors: ENABLED
+
+
+  # Lambda Function for API Operations (GET/PUT customer data)
+  CustomerDataFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'customer-data-function-${Stage}'
+      CodeUri: lambda/customer_data/
+      Handler: app.lambda_handler
+      Runtime: python3.9
+      Architectures:
+        - x86_64
+      MemorySize: 128
+      Timeout: 10
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref CustomerTable
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref CustomerTable
+            
+  # Lambda Function for CustomerV2 API Operations
+  CustomerV2DataFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'customer-v2-data-function-${Stage}'
+      CodeUri: lambda/customer_v2_data/
+      Handler: app.lambda_handler
+      Runtime: python3.9
+      Architectures:
+        - x86_64
+      MemorySize: 128
+      Timeout: 10
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref CustomerTable
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref CustomerTable
+
+  # Lambda Function for Custom Authorization
+  CustomAuthorizerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'custom-authorizer-${Stage}'
+      CodeUri: lambda/authorizer/
+      Handler: app.lambda_handler
+      Runtime: python3.9
+      Architectures:
+        - x86_64
+      MemorySize: 128
+      Timeout: 5
+      Environment:
+        Variables:
+          USER_POOL_ID: !Ref UserPool
+          APP_CLIENT_ID: !Ref UserPoolClient
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - 'cognito-idp:AdminInitiateAuth'
+                - 'cognito-idp:AdminGetUser'
+              Resource: !GetAtt UserPool.Arn
+
+  # API Gateway for V1 with Lambda Authorizer
+  CustomerAPI:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub 'customer-api-${Stage}'
+      StageName: !Ref Stage
+      EndpointConfiguration:
+        Type: REGIONAL
+      Auth:
+        DefaultAuthorizer: CustomAuthorizer
+        Authorizers:
+          CustomAuthorizer:
+            FunctionArn: !GetAtt CustomAuthorizerFunction.Arn
+            Identity:
+              Header: Authorization
+            ResultTtlInSeconds: 0
+            AuthorizerResultTtlInSeconds: 0
+      DefinitionBody:
+        swagger: '2.0'
+        info:
+          title: !Sub 'Customer API - ${Stage}'
+        paths:
+          /customers/{customerId}:
+            get:
+              x-amazon-apigateway-integration:
+                uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${CustomerDataFunction.Arn}/invocations'
+                passthroughBehavior: when_no_match
+                httpMethod: POST
+                type: aws_proxy
+              responses:
+                '200':
+                  description: 'Successful operation'
+            put:
+              x-amazon-apigateway-integration:
+                uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${CustomerDataFunction.Arn}/invocations'
+                passthroughBehavior: when_no_match
+                httpMethod: POST
+                type: aws_proxy
+              responses:
+                '200':
+                  description: 'Successful operation'
+                  
+  # API Gateway for V2 with Cognito Authorizer
+  CustomerV2API:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub 'customer-v2-api-${Stage}'
+      StageName: !Ref Stage
+      EndpointConfiguration:
+        Type: REGIONAL
+      DefinitionBody:
+        swagger: '2.0'
+        info:
+          title: !Sub 'Customer V2 API - ${Stage}'
+        securityDefinitions:
+          CognitoAuth:
+            type: apiKey
+            name: Authorization
+            in: header
+            x-amazon-apigateway-authtype: cognito_user_pools
+            x-amazon-apigateway-authorizer:
+              providerARNs:
+                - !GetAtt UserPool.Arn
+              type: cognito_user_pools
+              identitySource: method.request.header.Authorization
+        paths:
+          /customers/{customerId}:
+            get:
+              security:
+                - CognitoAuth: []
+              x-amazon-apigateway-integration:
+                uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${CustomerV2DataFunction.Arn}/invocations'
+                passthroughBehavior: when_no_match
+                httpMethod: POST
+                type: aws_proxy
+              responses:
+                '200':
+                  description: 'Successful operation'
+            put:
+              security:
+                - CognitoAuth: []
+              x-amazon-apigateway-integration:
+                uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${CustomerV2DataFunction.Arn}/invocations'
+                passthroughBehavior: when_no_match
+                httpMethod: POST
+                type: aws_proxy
+              responses:
+                '200':
+                  description: "Successful operation"
+
+
+  # Lambda Permission for API Gateway
+  CustomerDataFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref CustomerDataFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${CustomerAPI}/*'
+      
+  # Lambda Permission for CustomerV2 API Gateway
+  CustomerV2DataFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref CustomerV2DataFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${CustomerV2API}/*'
+
+  # Lambda Permission for Custom Authorizer
+  CustomAuthorizerPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref CustomAuthorizerFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${CustomerAPI}/authorizers/*'
+
+Outputs:
+  ApiEndpoint:
+    Description: API Gateway endpoint URL
+    Value: !Sub 'https://${CustomerAPI}.execute-api.${AWS::Region}.amazonaws.com/${Stage}'
+  ApiV2Endpoint:
+    Description: API Gateway V2 endpoint URL
+    Value: !Sub 'https://${CustomerV2API}.execute-api.${AWS::Region}.amazonaws.com/${Stage}'
+  UserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Description: Cognito User Pool Client ID
+    Value: !Ref UserPoolClient
+  CustomerTableName:
+    Description: DynamoDB Table Name
+    Value: !Ref CustomerTable
